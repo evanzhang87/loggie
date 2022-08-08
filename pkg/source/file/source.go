@@ -18,6 +18,9 @@ package file
 
 import (
 	"fmt"
+	"github.com/loggie-io/loggie/pkg/core/global"
+	"github.com/loggie-io/loggie/pkg/core/result"
+	"github.com/loggie-io/loggie/pkg/source/codec"
 	"time"
 
 	"github.com/loggie-io/loggie/pkg/core/api"
@@ -30,6 +33,7 @@ const Type = "file"
 
 func init() {
 	pipeline.Register(api.SOURCE, Type, makeSource)
+	globalLineEnd.Init()
 }
 
 func makeSource(info pipeline.Info) api.Component {
@@ -63,6 +67,7 @@ type Source struct {
 	isolation          Isolation
 	multilineProcessor *MultiProcessor
 	mTask              *MultiTask
+	codec              codec.Codec
 }
 
 func (s *Source) Config() interface{} {
@@ -81,6 +86,10 @@ func (s *Source) String() string {
 	return fmt.Sprintf("%s/%s/%s", s.Category(), s.Type(), s.name)
 }
 
+func (s *Source) SetCodec(c codec.Codec) {
+	s.codec = c
+}
+
 func (s *Source) Init(context api.Context) error {
 	s.name = context.Name()
 	s.out = make(chan api.Event, s.sinkCount)
@@ -92,6 +101,9 @@ func (s *Source) Init(context api.Context) error {
 	if mutiTimeout == 0 || mutiTimeout <= inactiveTimeout {
 		s.config.ReaderConfig.MultiConfig.Timeout = 2 * inactiveTimeout
 	}
+
+	// init reader chan size
+	s.config.ReaderConfig.readChanSize = s.config.WatchConfig.MaxOpenFds
 
 	// check
 	cleanInactiveTimeout := s.config.DbConfig.CleanInactiveTimeout
@@ -108,6 +120,7 @@ func (s *Source) Init(context api.Context) error {
 		SourceName:   s.name,
 		Level:        IsolationLevel(s.config.Isolation),
 	}
+	globalLineEnd.AddLineEnd(s.pipelineName, s.name, &s.config.ReaderConfig.LineDelimiter)
 	return nil
 }
 
@@ -142,7 +155,9 @@ func (s *Source) Stop() {
 		log.Info("[%s] all ack jobs of source exit", s.String())
 	}
 	// Stop watch task
-	s.watcher.StopWatchTask(s.watchTask)
+	if s.watchTask != nil {
+		s.watcher.StopWatchTask(s.watchTask)
+	}
 	log.Info("[%s] watch task stop", s.String())
 	// Stop reader
 	StopReader(s.isolation)
@@ -151,6 +166,7 @@ func (s *Source) Stop() {
 	if s.config.ReaderConfig.MultiConfig.Active {
 		s.multilineProcessor.StopTask(s.mTask)
 	}
+	globalLineEnd.RemoveLineEnd(s.pipelineName, s.name)
 	log.Info("source has stopped: %s", s.String())
 }
 
@@ -161,10 +177,16 @@ func (s *Source) Product() api.Event {
 func (s *Source) ProductLoop(productFunc api.ProductFunc) {
 	log.Info("%s start product loop", s.String())
 	s.productFunc = productFunc
+	if s.config.CollectConfig.AddonMeta {
+		s.productFunc = addonMetaProductFunc(s.productFunc)
+	}
 	if s.config.ReaderConfig.MultiConfig.Active {
 		s.mTask = NewMultiTask(s.epoch, s.name, s.config.ReaderConfig.MultiConfig, s.eventPool, s.productFunc)
 		s.multilineProcessor.StartTask(s.mTask)
 		s.productFunc = s.multilineProcessor.Process
+	}
+	if s.codec != nil {
+		s.productFunc = codec.ProductFunc(s.productFunc, s.codec)
 	}
 	if s.config.AckConfig.Enable {
 		s.ackTask = NewAckTask(s.epoch, s.pipelineName, s.name, func(state *State) {
@@ -188,4 +210,23 @@ func (s *Source) Commit(events []api.Event) {
 	}
 	// release events
 	s.eventPool.PutAll(events)
+}
+
+func addonMetaProductFunc(productFunc api.ProductFunc) api.ProductFunc {
+	return func(event api.Event) api.Result {
+		s, _ := event.Meta().Get(SystemStateKey)
+		state := s.(*State)
+		addonMeta := make(map[string]interface{})
+		addonMeta["pipeline"] = state.PipelineName
+		addonMeta["source"] = state.SourceName
+		addonMeta["filename"] = state.Filename
+		addonMeta["timestamp"] = state.CollectTime.Local().Format(tsLayout)
+		addonMeta["offset"] = state.Offset
+		addonMeta["bytes"] = state.ContentBytes
+		addonMeta["hostname"] = global.NodeName
+
+		event.Header()["state"] = addonMeta
+		productFunc(event)
+		return result.Success()
+	}
 }

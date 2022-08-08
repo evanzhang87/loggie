@@ -17,6 +17,7 @@ limitations under the License.
 package pipeline
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -32,7 +33,8 @@ import (
 	"github.com/loggie-io/loggie/pkg/core/sink"
 	"github.com/loggie-io/loggie/pkg/core/source"
 	"github.com/loggie-io/loggie/pkg/eventbus"
-	"github.com/loggie-io/loggie/pkg/sink/codec"
+	sinkcodec "github.com/loggie-io/loggie/pkg/sink/codec"
+	sourcecodec "github.com/loggie-io/loggie/pkg/source/codec"
 	"github.com/loggie-io/loggie/pkg/util"
 	"github.com/pkg/errors"
 )
@@ -68,7 +70,7 @@ func NewPipeline(pipelineConfig *Config) *Pipeline {
 		info: Info{
 			Stop:        false,
 			R:           registerCenter,
-			SurviveChan: make(chan api.Batch, 3),
+			SurviveChan: make(chan api.Batch, pipelineConfig.Sink.Parallelism+1),
 		},
 		r: registerCenter,
 	}
@@ -80,6 +82,9 @@ func (p *Pipeline) Stop() {
 	}
 
 	p.info.Stop = true
+	done := make(chan struct{})
+	// clean out chan: in case blocking
+	p.cleanOutChan(done)
 	// 0. stop sink consumer
 	p.stopSinkConsumer()
 	// 1. stop source product
@@ -93,24 +98,42 @@ func (p *Pipeline) Stop() {
 	p.stopListeners()
 	// 5. clean data(out chan、registry center、and so on)
 	p.cleanData()
+	close(done)
 
 	log.Info("stop pipeline with epoch: %+v", p.epoch)
 }
 
 func (p *Pipeline) stopSinkConsumer() {
+	// stop sink interceptor
+	for c, inter := range p.r.LoadCodeInterceptors() {
+		if i, ok := inter.(sink.Interceptor); ok {
+			log.Info("stop sink interceptor: %s", i.String())
+			i.Stop()
+			p.r.RemoveByCode(c)
+			log.Info("sink interceptor stopped: %s", i.String())
+		}
+	}
+	// stop sink consumer and survive
 	close(p.done)
 	p.countDown.Wait()
-	// clean out chan: in case source blocking
-	p.cleanOutChan()
 }
 
 func (p *Pipeline) stopSourceProduct() {
+	taskName := fmt.Sprintf("stop sources of pipeline(%s)", p.name)
+	namedJob := make(map[string]func())
 	for name, s := range p.ns {
+		localName := name
 		localSource := s
-		localSource.Stop()
-		p.r.removeComponent(localSource.Type(), localSource.Category(), name)
-		p.reportMetric(name, localSource, eventbus.ComponentStop)
+
+		p.r.removeComponent(localSource.Type(), localSource.Category(), localName)
+		jobName := fmt.Sprintf("stop source(%s)", localName)
+		job := func() {
+			localSource.Stop()
+			p.reportMetric(localName, localSource, eventbus.ComponentStop)
+		}
+		namedJob[jobName] = job
 	}
+	util.AsyncRunGroup(taskName, namedJob)
 }
 
 func (p *Pipeline) stopQueue() {
@@ -125,11 +148,11 @@ func (p *Pipeline) stopQueue() {
 
 func (p *Pipeline) stopComponents() {
 	log.Debug("stopping components of pipeline %s", p.name)
-	for name, v := range p.r.nameComponents {
+	for name, v := range p.r.LoadCodeComponents() {
 		// async stop with timeout
 		n := name
 		c := v
-		delete(p.r.nameComponents, n)
+		p.r.RemoveByCode(n)
 		util.AsyncRunWithTimeout(func() {
 			c.Stop()
 			p.reportMetricWithCode(n, c, eventbus.ComponentStop)
@@ -148,8 +171,6 @@ func (p *Pipeline) stopListeners() {
 }
 
 func (p *Pipeline) cleanData() {
-	// clean out chan
-	p.cleanOutChan()
 	// clean registry center
 	p.r.cleanData()
 	// clean pipeline
@@ -159,29 +180,31 @@ func (p *Pipeline) cleanData() {
 	p.r = nil
 }
 
-func (p *Pipeline) cleanOutChan() {
+func (p *Pipeline) cleanOutChan(done <-chan struct{}) {
 	for _, outChan := range p.outChans {
 		out := outChan
-		if len(out) == 0 {
-			continue
-		}
-		go p.consumerOutChanAndDrop(out)
+		go p.consumerOutChanAndDrop(out, done)
 	}
 }
 
-func (p *Pipeline) consumerOutChanAndDrop(out chan api.Batch) {
-	after := time.NewTimer(p.config.CleanDataTimeout)
-	defer after.Stop()
+func (p *Pipeline) consumerOutChanAndDrop(out chan api.Batch, done <-chan struct{}) {
+	dropAndRelease := func(batch api.Batch) {
+		if batch != nil {
+			events := batch.Events()
+			if events != nil {
+				p.info.EventPool.PutAll(events)
+			}
+			batch.Release()
+		}
+	}
 	for {
 		select {
-		case <-after.C:
+		case <-done:
 			return
 		case b := <-out:
-			// drop
-			p.finalizeBatch(b)
+			dropAndRelease(b)
 		case b := <-p.info.SurviveChan:
-			// drop
-			p.finalizeBatch(b)
+			dropAndRelease(b)
 		}
 	}
 }
@@ -297,7 +320,10 @@ func (p *Pipeline) startWithComponent(component api.Component, ctx api.Context) 
 		return errors.WithMessagef(err, "start component %s/%s", component.Category(), component.Type())
 	}
 
-	p.r.Register(component, ctx.Name())
+	err = p.r.Register(component, ctx.Name())
+	if err != nil {
+		return err
+	}
 	p.reportMetric(ctx.Name(), component, eventbus.ComponentStart)
 	return nil
 }
@@ -357,6 +383,10 @@ func (p *Pipeline) validateComponent(ctx api.Context) error {
 
 func (p *Pipeline) validate() error {
 	pipelineConfig := &p.config
+	if pipelineConfig.Name == "" {
+		return errors.New("pipelines[n].name is required")
+	}
+
 	for _, iConfig := range pipelineConfig.Interceptors {
 		ctx := context.NewContext(iConfig.Name, api.Type(iConfig.Type), api.INTERCEPTOR, iConfig.Properties)
 		if err := p.validateComponent(ctx); err != nil {
@@ -371,12 +401,18 @@ func (p *Pipeline) validate() error {
 	}
 
 	sinkConfig := pipelineConfig.Sink
+	if sinkConfig == nil || sinkConfig.Type == "" {
+		return errors.New("pipelines[n].sink is required")
+	}
 	ctx = context.NewContext(sinkConfig.Name, api.Type(sinkConfig.Type), api.SINK, sinkConfig.Properties)
 	if err := p.validateComponent(ctx); err != nil {
 		return err
 	}
 
 	unique := make(map[string]struct{})
+	if len(pipelineConfig.Sources) == 0 {
+		return errors.New("pipelines[n].source is required")
+	}
 	for _, sourceConfig := range pipelineConfig.Sources {
 		if _, ok := unique[sourceConfig.Name]; ok {
 			return errors.Errorf("source name %s is duplicated", sourceConfig.Name)
@@ -398,7 +434,7 @@ func (p *Pipeline) startSink(sinkConfigs *sink.Config) error {
 	codecConf := sinkConfigs.Codec
 
 	// init codec
-	cod, ok := codec.Get(codecConf.Type)
+	cod, ok := sinkcodec.Get(codecConf.Type)
 	if !ok {
 		return errors.Errorf("codec %s cannot be found", codecConf.Type)
 	}
@@ -413,7 +449,7 @@ func (p *Pipeline) startSink(sinkConfigs *sink.Config) error {
 
 	// set codec to sink
 	component, _ := GetWithType(ctx.Category(), ctx.Type(), p.info)
-	if si, ok := component.(codec.SinkCodec); ok {
+	if si, ok := component.(sinkcodec.SinkCodec); ok {
 		si.SetCodec(cod)
 	}
 
@@ -422,7 +458,7 @@ func (p *Pipeline) startSink(sinkConfigs *sink.Config) error {
 
 func (p *Pipeline) startSinkConsumer(sinkConfig *sink.Config) {
 	interceptors := make([]sink.Interceptor, 0)
-	for _, inter := range p.r.Components(api.INTERCEPTOR) {
+	for _, inter := range p.r.LoadCodeInterceptors() {
 		i, ok := inter.(sink.Interceptor)
 		if !ok {
 			continue
@@ -531,7 +567,33 @@ func (p *Pipeline) startSource(sourceConfigs []source.Config) error {
 		}
 
 		ctx := context.NewContext(sourceConfig.Name, api.Type(sourceConfig.Type), api.SOURCE, sourceConfig.Properties)
-		err := p.startComponent(ctx)
+
+		component, _ := GetWithType(ctx.Category(), ctx.Type(), p.info)
+
+		// get codec config
+		codecConf := sourceConfig.Codec
+		if codecConf != nil {
+			// init codec
+			cod, ok := sourcecodec.Get(codecConf.Type)
+			if !ok {
+				return errors.Errorf("codec %s cannot be found", codecConf.Type)
+			}
+			if conf, ok := cod.(api.Config); ok {
+				err := cfg.UnpackAndDefaults(codecConf.CommonCfg, conf.Config())
+				if err != nil {
+					// since Loggie has validate the configuration before start, we would never reach here
+					return errors.WithMessage(err, "unpack codec config error")
+				}
+			}
+			cod.Init()
+
+			// set codec to source
+			if si, ok := component.(sourcecodec.SourceCodec); ok {
+				si.SetCodec(cod)
+			}
+		}
+
+		err := p.startWithComponent(component, ctx)
 		if err != nil {
 			return err
 		}
@@ -548,7 +610,7 @@ func (p *Pipeline) startSourceProduct(sourceConfigs []source.Config) {
 
 		sourceConfig := sc
 		interceptors := make([]source.Interceptor, 0)
-		for _, inter := range p.r.LoadInterceptors() {
+		for _, inter := range p.r.LoadCodeInterceptors() {
 			i, ok := inter.(source.Interceptor)
 			if !ok {
 				continue
@@ -572,6 +634,13 @@ func (p *Pipeline) startSourceProduct(sourceConfigs []source.Config) {
 				Event: e,
 				Queue: q,
 			})
+
+			if result.Status() == api.DROP {
+				p.info.EventPool.Put(e)
+			}
+			if result.Status() == api.FAIL {
+				log.Error("source to queue failed: %s", result.Error())
+			}
 			return result
 		}
 		go si.Source.ProductLoop(productFunc)
@@ -703,6 +772,9 @@ func collectComponentDependencyInterceptors(component api.Component) []api.Inter
 }
 
 func (p *Pipeline) survive() {
+	p.countDown.Add(1)
+	defer p.countDown.Done()
+
 	for {
 		select {
 		case <-p.done:

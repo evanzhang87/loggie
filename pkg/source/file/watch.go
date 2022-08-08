@@ -49,7 +49,7 @@ type Watcher struct {
 	config                 WatchConfig
 	sourceWatchTasks       map[string]*WatchTask // key:pipelineName:sourceName
 	waiteForStopWatchTasks map[string]*WatchTask
-	watchTaskChan          chan *WatchTask
+	watchTaskEventChan     chan WatchTaskEvent
 	osWatcher              *fsnotify.Watcher
 	osWatchFiles           map[string]bool // key:file|value:1;only zombie job file need os notify
 	allJobs                map[string]*Job // key:`pipelineName:sourceName:job.Uid`|value:*job
@@ -67,7 +67,7 @@ func newWatcher(config WatchConfig, dbHandler *dbHandler) *Watcher {
 		config:                 config,
 		sourceWatchTasks:       make(map[string]*WatchTask),
 		waiteForStopWatchTasks: make(map[string]*WatchTask),
-		watchTaskChan:          make(chan *WatchTask),
+		watchTaskEventChan:     make(chan WatchTaskEvent),
 		dbHandler:              dbHandler,
 		zombieJobChan:          make(chan *Job, config.MaxOpenFds+1),
 		allJobs:                make(map[string]*Job),
@@ -102,20 +102,24 @@ func (w *Watcher) Stop() {
 }
 
 func (w *Watcher) StopWatchTask(watchTask *WatchTask) {
-	watchTask.watchTaskType = STOP
 	watchTask.stopTime = time.Now()
 	watchTask.countDown.Add(1)
-	w.watchTaskChan <- watchTask
+	w.watchTaskEventChan <- WatchTaskEvent{
+		watchTaskType: STOP,
+		watchTask:     watchTask,
+	}
 	watchTask.countDown.Wait()
-	stopCost := (time.Since(watchTask.stopTime)) / time.Second
+	stopCost := time.Since(watchTask.stopTime)
 	if stopCost > 10*time.Second {
-		log.Warn("watchTask(%s) stop cost: %ds", watchTask.String(), stopCost)
+		log.Warn("watchTask(%s) stop cost: %ds", watchTask.String(), stopCost/time.Second)
 	}
 }
 
 func (w *Watcher) StartWatchTask(watchTask *WatchTask) {
-	watchTask.watchTaskType = START
-	w.watchTaskChan <- watchTask
+	w.watchTaskEventChan <- WatchTaskEvent{
+		watchTaskType: START,
+		watchTask:     watchTask,
+	}
 }
 
 func (w *Watcher) preAllocationOffset(size int64, job *Job) {
@@ -169,7 +173,7 @@ func (w *Watcher) removeOsNotify(file string) {
 	if w.osWatcher != nil {
 		err := w.osWatcher.Remove(file)
 		if err != nil {
-			log.Warn("remove file(%s) os notify fail: %v", file, err)
+			log.Debug("remove file(%s) os notify fail: %v", file, err)
 		}
 	}
 }
@@ -277,17 +281,19 @@ func (w *Watcher) eventBus(e jobEvent) {
 		existAckOffset := existRegistry.Offset
 		fileSize := stat.Size()
 		// check whether the existAckOffset is larger than the file size
-		if existAckOffset > fileSize+1 {
+		if existAckOffset > fileSize+int64(len(job.GetEncodeLineEnd())) {
 			log.Warn("new job(jobUid:%s) fileName(%s) existRegistry(%+v) ackOffset is larger than file size(%d).is inode repeat?", job.Uid(), filename, existRegistry, fileSize)
 			// file was truncated，start from the beginning
 			if job.task.config.RereadTruncated {
 				existAckOffset = 0
 			}
 		}
-		// PreAllocationOffsetWithSize
-		if existAckOffset == 0 && w.config.ReadFromTail {
-			w.preAllocationOffset(fileSize, job)
-			existAckOffset = fileSize
+		// Pre-allocation offset
+		if existAckOffset == 0 {
+			if w.config.ReadFromTail {
+				existAckOffset = fileSize
+			}
+			w.preAllocationOffset(existAckOffset, job)
 		}
 		// set ack offset
 		job.NextOffset(existAckOffset)
@@ -457,12 +463,19 @@ func (w *Watcher) legalFile(filename string, watchTask *WatchTask, withIgnoreOld
 }
 
 func (w *Watcher) scan() {
+	start := time.Now()
+
 	// check any new files
 	w.scanNewFiles()
 	// active job
 	w.scanActiveJob()
 	// zombie job
 	w.scanZombieJob()
+
+	scanCost := time.Since(start)
+	if scanCost > 3*time.Second {
+		log.Warn("watch scan cost: %ds", scanCost/time.Second)
+	}
 }
 
 func (w *Watcher) scanActiveJob() {
@@ -585,8 +598,9 @@ func (w *Watcher) finalizeJob(job *Job) {
 	for k, task := range w.waiteForStopWatchTasks {
 		delete(task.waiteForStopJobs, job.WatchUid())
 		if len(task.waiteForStopJobs) == 0 {
-			task.countDown.Done()
+			task.waiteForStopJobs = nil
 			delete(w.waiteForStopWatchTasks, k)
+			task.countDown.Done()
 		}
 	}
 }
@@ -615,8 +629,8 @@ func (w *Watcher) run() {
 		select {
 		case <-w.done:
 			return
-		case watchTask := <-w.watchTaskChan:
-			w.handleWatchTaskEvent(watchTask)
+		case watchTaskEvent := <-w.watchTaskEventChan:
+			w.handleWatchTaskEvent(watchTaskEvent)
 		case job := <-w.zombieJobChan:
 			w.decideZombieJob(job)
 		case e := <-osEvents:
@@ -630,12 +644,20 @@ func (w *Watcher) run() {
 	}
 }
 
-func (w *Watcher) handleWatchTaskEvent(watchTask *WatchTask) {
+func (w *Watcher) handleWatchTaskEvent(watchTaskEvent WatchTaskEvent) {
+	taskType := watchTaskEvent.watchTaskType
+	watchTask := watchTaskEvent.watchTask
 	key := watchTask.WatchTaskKey()
-	if watchTask.watchTaskType == START {
+	if taskType == START {
+		// WatchTask may be stopped at the moment of starting
+		if watchTask.IsStop() {
+			return
+		}
 		w.sourceWatchTasks[key] = watchTask
 		w.cleanWatchTaskRegistry(watchTask)
-	} else if watchTask.watchTaskType == STOP {
+		return
+	}
+	if taskType == STOP {
 		log.Info("try to stop watch task: %s", watchTask.String())
 		delete(w.sourceWatchTasks, key)
 		// Delete the jobs of the corresponding source
@@ -653,8 +675,41 @@ func (w *Watcher) handleWatchTaskEvent(watchTask *WatchTask) {
 		if len(waitForStopJobs) > 0 {
 			watchTask.waiteForStopJobs = waitForStopJobs
 			w.waiteForStopWatchTasks[watchTask.WatchTaskKey()] = watchTask
+
+			// Try to stop jobs more aggressively
+			w.aggressivelyStopWatchTask(watchTask)
 		} else {
 			watchTask.countDown.Done()
+		}
+		return
+	}
+}
+
+func (w *Watcher) aggressivelyStopWatchTask(watchTask *WatchTask) {
+	go w.asyncStopTaskJobs(watchTask)
+
+	if len(w.zombieJobChan) > 0 {
+		for j := range w.zombieJobChan {
+			w.decideZombieJob(j)
+			if len(w.zombieJobChan) == 0 {
+				break
+			}
+		}
+	}
+}
+
+func (w *Watcher) asyncStopTaskJobs(watchTask *WatchTask) {
+	timeout := time.NewTimer(w.config.CleanDataTimeout)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-timeout.C:
+			return
+		case j := <-watchTask.activeChan:
+			w.decideJob(j)
 		}
 	}
 }
@@ -723,11 +778,13 @@ func (w *Watcher) osNotify(e fsnotify.Event) {
 			return
 		}
 		jobUid := JobUid(stat)
-		if existJob, ok := w.allJobs[jobUid]; ok {
-			w.eventBus(jobEvent{
-				opt: WRITE,
-				job: existJob,
-			})
+		for _, existJob := range w.allJobs {
+			if existJob.Uid() == jobUid {
+				w.eventBus(jobEvent{
+					opt: WRITE,
+					job: existJob,
+				})
+			}
 		}
 	}
 }
@@ -754,9 +811,6 @@ func (w *Watcher) checkWaitForStopTask() {
 				job.Stop()
 				w.finalizeJob(job)
 			}
-			watchTask.waiteForStopJobs = nil
-			delete(w.waiteForStopWatchTasks, watchTask.WatchTaskKey())
-			watchTask.countDown.Done()
 		}
 	}
 }

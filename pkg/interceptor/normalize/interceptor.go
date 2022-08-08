@@ -18,6 +18,7 @@ package normalize
 
 import (
 	"fmt"
+	"github.com/loggie-io/loggie/pkg/eventbus"
 
 	"github.com/loggie-io/loggie/pkg/core/api"
 	"github.com/loggie-io/loggie/pkg/core/log"
@@ -41,12 +42,14 @@ func makeInterceptor(info pipeline.Info) api.Component {
 	}
 }
 
+// Interceptor Deprecated, use transformer instead
 type Interceptor struct {
 	done           chan struct{}
 	pipelineName   string
 	name           string
 	config         *Config
 	ProcessorGroup *ProcessorGroup
+	MetricContext  *eventbus.NormalizeMetricEvent
 }
 
 func (i *Interceptor) Config() interface{} {
@@ -68,8 +71,15 @@ func (i *Interceptor) String() string {
 func (i *Interceptor) Init(context api.Context) error {
 	i.name = context.Name()
 	pg := NewProcessorGroup(i.config.Processors)
-	pg.InitAll()
+	pg.InitAll(i)
 	i.ProcessorGroup = pg
+	metricEvent := &eventbus.NormalizeMetricEvent{
+		MetricMap:    make(map[string]*eventbus.NormalizeMetricData),
+		PipelineName: i.pipelineName,
+		Name:         i.name,
+		IsClear:      false,
+	}
+	i.MetricContext = metricEvent
 	return nil
 }
 
@@ -79,6 +89,7 @@ func (i *Interceptor) Start() error {
 
 func (i *Interceptor) Stop() {
 	close(i.done)
+	i.clearMetric()
 }
 
 func (i *Interceptor) Intercept(invoker source.Invoker, invocation source.Invocation) api.Result {
@@ -88,6 +99,7 @@ func (i *Interceptor) Intercept(invoker source.Invoker, invocation source.Invoca
 		log.Error("normalize event %s error: %v", e.String(), err)
 	}
 
+	i.flushMetric()
 	return invoker.Invoke(invocation)
 }
 

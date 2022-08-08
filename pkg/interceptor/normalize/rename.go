@@ -18,6 +18,7 @@ package normalize
 
 import (
 	"github.com/loggie-io/loggie/pkg/core/api"
+	eventer "github.com/loggie-io/loggie/pkg/core/event"
 	"github.com/loggie-io/loggie/pkg/core/log"
 	"github.com/loggie-io/loggie/pkg/util/runtime"
 )
@@ -25,7 +26,8 @@ import (
 const ProcessorMove = "rename"
 
 type MoveProcessor struct {
-	config *MoveConfig
+	config      *MoveConfig
+	interceptor *Interceptor
 }
 
 type MoveConfig struct {
@@ -48,7 +50,12 @@ func (r *MoveProcessor) Config() interface{} {
 	return r.config
 }
 
-func (r *MoveProcessor) Init() {
+func (r *MoveProcessor) Init(interceptor *Interceptor) {
+	r.interceptor = interceptor
+}
+
+func (r *MoveProcessor) GetName() string {
+	return ProcessorMove
 }
 
 func (r *MoveProcessor) Process(e api.Event) error {
@@ -65,14 +72,25 @@ func (r *MoveProcessor) Process(e api.Event) error {
 		from := convert.From
 
 		obj := runtime.NewObject(header)
-		val := obj.GetPath(from)
-		if val.IsNull() {
-			log.Info("move fields from %s is not exist", from)
-			log.Debug("move event: %s", e.String())
+		if from == eventer.Body {
+			obj.SetPath(convert.To, string(e.Body()))
+			e.Fill(e.Meta(), e.Header(), []byte{})
 			continue
 		}
-		obj.DelPath(from)
-		obj.SetPath(convert.To, val.Value())
+		pathVal := obj.GetPath(from)
+		if !pathVal.IsNull() {
+			obj.DelPath(from)
+			obj.SetPath(convert.To, pathVal.Value())
+			continue
+		}
+		val := obj.Get(from)
+		if !val.IsNull() {
+			obj.Del(from)
+			obj.Set(convert.To, val.Value())
+			continue
+		}
+		log.Info("move fields from %s is not exist", from)
+		log.Debug("move event: %s", e.String())
 	}
 
 	return nil

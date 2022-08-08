@@ -18,13 +18,13 @@ package controller
 
 import (
 	"fmt"
+	"github.com/goccy/go-yaml"
 
 	"github.com/loggie-io/loggie/pkg/control"
 	"github.com/loggie-io/loggie/pkg/core/log"
 	logconfigv1beta1 "github.com/loggie-io/loggie/pkg/discovery/kubernetes/apis/loggie/v1beta1"
 	"github.com/loggie-io/loggie/pkg/util"
 	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/runtime"
@@ -55,13 +55,11 @@ func (c *Controller) reconcileClusterLogConfig(element Element) error {
 	}
 
 	err, keys := c.reconcileClusterLogConfigAddOrUpdate(clusterLogConfig)
-	if err != nil {
-		msg := fmt.Sprintf(MessageSyncFailed, clusterLogConfig.Spec.Selector.Type, keys, err.Error())
-		c.record.Event(clusterLogConfig, corev1.EventTypeWarning, ReasonFailed, msg)
-	} else if len(keys) != 0 {
+	if len(keys) > 0 {
 		msg := fmt.Sprintf(MessageSyncSuccess, clusterLogConfig.Spec.Selector.Type, keys)
 		c.record.Event(clusterLogConfig, corev1.EventTypeNormal, ReasonSuccess, msg)
 	}
+	// no need to record failed event here because we recorded events when received pod create/update
 	return err
 }
 
@@ -82,10 +80,7 @@ func (c *Controller) reconcileLogConfig(element Element) error {
 	}
 
 	err, keys := c.reconcileLogConfigAddOrUpdate(logConf)
-	if err != nil {
-		msg := fmt.Sprintf(MessageSyncFailed, logConf.Spec.Selector.Type, keys, err.Error())
-		c.record.Event(logConf, corev1.EventTypeWarning, ReasonFailed, msg)
-	} else if len(keys) != 0 {
+	if len(keys) > 0 {
 		msg := fmt.Sprintf(MessageSyncSuccess, logConf.Spec.Selector.Type, keys)
 		c.record.Event(logConf, corev1.EventTypeNormal, ReasonSuccess, msg)
 	}
@@ -240,6 +235,7 @@ func (c *Controller) reconcileLogConfigAddOrUpdate(lgc *logconfigv1beta1.LogConf
 }
 
 func (c *Controller) handleAllTypesAddOrUpdate(lgc *logconfigv1beta1.LogConfig) (err error, keys []string) {
+	lgc = lgc.DeepCopy()
 	switch lgc.Spec.Selector.Type {
 	case logconfigv1beta1.SelectorTypePod:
 		return c.handleLogConfigTypePodAddOrUpdate(lgc)

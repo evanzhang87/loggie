@@ -27,8 +27,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/loggie-io/loggie/pkg/core/global"
-
 	"github.com/loggie-io/loggie/pkg/core/log"
 	"github.com/loggie-io/loggie/pkg/util"
 )
@@ -68,6 +66,9 @@ type Job struct {
 
 	EofCount       int
 	LastActiveTime time.Time
+
+	lineEnd       []byte
+	encodeLineEnd []byte
 }
 
 func JobUid(fileInfo os.FileInfo) string {
@@ -294,11 +295,19 @@ func (j *Job) File() *os.File {
 
 const tsLayout = "2006-01-02T15:04:05.000Z"
 
+func (j *Job) GetEncodeLineEnd() []byte {
+	return j.lineEnd
+}
+
+func (j *Job) GetLineEnd() []byte {
+	return j.encodeLineEnd
+}
+
 func (j *Job) ProductEvent(endOffset int64, collectTime time.Time, body []byte) {
-	nextOffset := endOffset + 1
+	nextOffset := endOffset + int64(len(j.GetEncodeLineEnd()))
 	contentBytes := int64(len(body))
 	// -1 because `\n`
-	startOffset := nextOffset - contentBytes - 1
+	startOffset := nextOffset - contentBytes - int64(len(j.GetEncodeLineEnd()))
 
 	j.currentLineNumber++
 	j.currentLines++
@@ -308,7 +317,7 @@ func (j *Job) ProductEvent(endOffset int64, collectTime time.Time, body []byte) 
 
 	endOffsetStr := strconv.FormatInt(endOffset, 10)
 	var eventUid strings.Builder
-	eventUid.Grow(j.watchUidLen + 1 + len(endOffsetStr))
+	eventUid.Grow(j.watchUidLen + len(j.GetEncodeLineEnd()) + len(endOffsetStr))
 	eventUid.WriteString(watchUid)
 	eventUid.WriteString("-")
 	eventUid.WriteString(endOffsetStr)
@@ -321,7 +330,7 @@ func (j *Job) ProductEvent(endOffset int64, collectTime time.Time, body []byte) 
 		LineNumber:   j.currentLineNumber,
 		Filename:     j.filename,
 		CollectTime:  collectTime,
-		ContentBytes: contentBytes + 1, // because `\n`
+		ContentBytes: contentBytes + int64(len(j.GetEncodeLineEnd())), // because `\n`
 		JobUid:       j.Uid(),
 		JobIndex:     j.Index(),
 		watchUid:     watchUid,
@@ -329,20 +338,6 @@ func (j *Job) ProductEvent(endOffset int64, collectTime time.Time, body []byte) 
 	}
 	e := j.task.eventPool.Get()
 	e.Meta().Set(SystemStateKey, state)
-
-	if j.task.config.AddonMeta {
-		addonMeta := make(map[string]interface{})
-		addonMeta["pipeline"] = state.PipelineName
-		addonMeta["source"] = state.SourceName
-		addonMeta["filename"] = state.Filename
-		addonMeta["timestamp"] = state.CollectTime.Local().Format(tsLayout)
-		addonMeta["offset"] = state.Offset
-		addonMeta["bytes"] = state.ContentBytes
-		addonMeta["hostname"] = global.NodeName
-
-		e.Header()["state"] = addonMeta
-	}
-
 	// copy body,because readBuffer reuse
 	contentBuffer := make([]byte, contentBytes)
 	copy(contentBuffer, body)
@@ -357,10 +352,12 @@ func NewJob(task *WatchTask, filename string, fileInfo os.FileInfo) *Job {
 
 func newJobWithUid(task *WatchTask, filename string, jobUid string) *Job {
 	j := &Job{
-		task:     task,
-		index:    jobIndex(),
-		filename: filename,
-		uid:      jobUid,
+		task:          task,
+		index:         jobIndex(),
+		filename:      filename,
+		uid:           jobUid,
+		lineEnd:       globalLineEnd.GetLineEnd(task.pipelineName, task.sourceName),
+		encodeLineEnd: globalLineEnd.GetEncodeLineEnd(task.pipelineName, task.sourceName),
 	}
 	j.aFileName.Store(filename)
 	return j

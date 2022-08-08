@@ -18,8 +18,8 @@ package elasticsearch
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"github.com/pkg/errors"
 
 	"github.com/loggie-io/loggie/pkg/util/pattern"
 
@@ -79,9 +79,9 @@ func (s *Sink) Init(context api.Context) error {
 }
 
 func (s *Sink) Start() error {
-	indexMatchers := pattern.MustInitMatcher(s.config.Index)
-	documentIdMatchers := pattern.MustInitMatcher(s.config.DocumentId)
-	cli, err := NewClient(s.config, s.codec, indexMatchers, documentIdMatchers)
+	indexPattern, _ := pattern.Init(s.config.Index)
+	documentIdPattern, _ := pattern.Init(s.config.DocumentId)
+	cli, err := NewClient(s.config, s.codec, indexPattern, documentIdPattern)
 	if err != nil {
 		log.Error("start elasticsearch connection fail, err: %v", err)
 		return err
@@ -97,16 +97,14 @@ func (s *Sink) Stop() {
 }
 
 func (s *Sink) Consume(batch api.Batch) api.Result {
-	if s.cli != nil {
-		err := s.cli.BulkIndex(context.TODO(), batch)
-		if err != nil {
-			log.Error("write to elasticsearch error: %+v", err)
-			return result.Fail(err)
-		}
-
-		return result.Success()
+	if s.cli == nil {
+		return result.Fail(clientNotInitError)
 	}
 
-	log.Error("%v", clientNotInitError)
-	return result.Fail(clientNotInitError)
+	err := s.cli.BulkIndex(context.TODO(), batch)
+	if err != nil {
+		return result.Fail(errors.WithMessage(err, "send events to elasticsearch"))
+	}
+
+	return result.Success()
 }

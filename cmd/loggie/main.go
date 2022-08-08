@@ -19,12 +19,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net/http"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
-
+	"github.com/goccy/go-yaml"
 	"github.com/loggie-io/loggie/pkg/control"
 	"github.com/loggie-io/loggie/pkg/core/cfg"
 	"github.com/loggie-io/loggie/pkg/core/global"
@@ -37,7 +32,11 @@ import (
 	_ "github.com/loggie-io/loggie/pkg/include"
 	"github.com/loggie-io/loggie/pkg/pipeline"
 	"go.uber.org/automaxprocs/maxprocs"
-	"gopkg.in/yaml.v2"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 var (
@@ -59,17 +58,18 @@ func init() {
 
 func main() {
 	flag.Parse()
+	// init logging configuration
 	log.InitDefaultLogger()
+
+	log.Info("version: %s", global.GetVersion())
 
 	// set up signals so we handle the first shutdown signal gracefully
 	stopCh := signals.SetupSignalHandler()
 
-	// init logging configuration
 	// Automatically set GOMAXPROCS to match Linux container CPU quota
 	if _, err := maxprocs.Set(maxprocs.Logger(log.Debug)); err != nil {
 		log.Fatal("set maxprocs error: %v", err)
 	}
-	configType = strings.ToLower(configType)
 	log.Info("real GOMAXPROCS %d", runtime.GOMAXPROCS(-1))
 
 	global.NodeName = nodeName
@@ -77,7 +77,7 @@ func main() {
 
 	// system config file
 	syscfg := sysconfig.Config{}
-	cfg.UnpackTypeDefaultsAndValidate(configType, globalConfigFile, &syscfg)
+	cfg.UnpackTypeDefaultsAndValidate(strings.ToLower(configType), globalConfigFile, &syscfg)
 
 	setDefaultPipelines(syscfg.Loggie.Defaults)
 

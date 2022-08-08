@@ -148,6 +148,26 @@ func (obj *Object) String() (string, error) {
 	return "", errors.New("type assertion to string failed")
 }
 
+func (obj *Object) Int64() (int64, error) {
+	if obj.data == nil {
+		return 0, nil
+	}
+	if s, ok := (obj.data).(int64); ok {
+		return s, nil
+	}
+	return 0, errors.New("type assertion to int failed")
+}
+
+func (obj *Object) Float64() (float64, error) {
+	if obj.data == nil {
+		return 0, nil
+	}
+	if s, ok := (obj.data).(float64); ok {
+		return s, nil
+	}
+	return 0, errors.New("type assertion to float64 failed")
+}
+
 func (obj *Object) IsNull() bool {
 	if obj == nil || obj.data == nil {
 		return true
@@ -159,7 +179,7 @@ func (obj *Object) Value() interface{} {
 	return obj.data
 }
 
-func (obj *Object) FlatKeyValue() (map[string]interface{}, error) {
+func (obj *Object) FlatKeyValue(token string) (map[string]interface{}, error) {
 	m, err := obj.Map()
 	if err != nil {
 		return nil, err
@@ -168,20 +188,18 @@ func (obj *Object) FlatKeyValue() (map[string]interface{}, error) {
 		return m, nil
 	}
 	dest := make(map[string]interface{})
-	flatten("", m, dest)
+	flatten(token, "", m, dest)
 	return dest, nil
 }
 
-const token = "_"
-
-func flatten(prefix string, src map[string]interface{}, dest map[string]interface{}) {
+func flatten(token string, prefix string, src map[string]interface{}, dest map[string]interface{}) {
 	if len(prefix) > 0 {
 		prefix += token
 	}
 	for k, v := range src {
 		switch child := v.(type) {
 		case map[string]interface{}:
-			flatten(prefix+k, child, dest)
+			flatten(token, prefix+k, child, dest)
 		case []interface{}:
 			for i := 0; i < len(child); i++ {
 				dest[prefix+k+token+strconv.Itoa(i)] = child[i]
